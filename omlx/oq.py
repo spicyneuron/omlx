@@ -12,6 +12,7 @@ base bits and add targeted routed-expert protection plus a higher bpw budget.
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -3187,6 +3188,10 @@ def _calibration_memory_budget(
     candidates = [value for value in (system_available, metal_available) if value > 0]
     capacity = min(candidates) if candidates else max(0, int(fallback_system_bytes))
     model_limit = int(capacity * _MAX_MODEL_RAM_FRACTION)
+    # Local escape hatch: absolute calibration budget in GiB.
+    override = os.environ.get("OMLX_OQ_CALIBRATION_LIMIT_GB", "").strip()
+    if override:
+        model_limit = int(float(override) * 1024**3)
     checkpoint_bytes = max(0, int(checkpoint_bytes))
     return {
         "system_available_bytes": int(system_available),
