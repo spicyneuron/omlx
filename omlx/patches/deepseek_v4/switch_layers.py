@@ -20,7 +20,12 @@ _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
 _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
 _DEEPSEEK_MXFP4_LARGE_BLOCK_BM = 32
 _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT = 2
-_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = 8192
+_DEEPSEEK_AFFINE_LARGE_BLOCK_MIN_ROUTES = 8192
+# Tuned on M3 Ultra. Set this to 8192 to restore the previous crossover on
+# other pre-NAX chips; M5 prefill uses the NAX fallback below.
+_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = int(
+    os.environ.get("OMLX_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES", "16384")
+)
 
 # On NAX GPUs (M5 family) mx.gather_qmm dispatches to the tensor-unit
 # gather_qmm_rhs_nax kernels, which beat the pre-NAX block-list kernels for
@@ -143,8 +148,15 @@ def _build_mxfp4_blocks(indices: mx.array, num_experts: int, bm: int):
     )
 
 
-def _mxfp4_block_config(num_routes: int) -> tuple[int, int]:
-    if num_routes >= _DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES:
+def _block_config(num_routes: int, native_kind: str) -> tuple[int, int]:
+    if native_kind == "mxfp4":
+        large_block_min_routes = _DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES
+    elif native_kind == "affine":
+        large_block_min_routes = _DEEPSEEK_AFFINE_LARGE_BLOCK_MIN_ROUTES
+    else:
+        raise ValueError(f"Unsupported native block kind: {native_kind}")
+
+    if num_routes >= large_block_min_routes:
         return (
             _DEEPSEEK_MXFP4_LARGE_BLOCK_BM,
             _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT,
@@ -268,7 +280,7 @@ class QuantizedSwitchLinear(nn.Module):
         native_kind = self._native_block_kind(x, sorted_indices)
         if native_kind is not None:
             if block_plan is None:
-                block_bm, block_variant = _mxfp4_block_config(indices.size)
+                block_bm, block_variant = _block_config(indices.size, native_kind)
                 block_meta, block_count = _build_mxfp4_blocks(
                     indices,
                     self.num_experts,
@@ -401,7 +413,7 @@ class SwitchGLU(nn.Module):
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
-    def __call__(self, x, indices, scores=None) -> mx.array:
+    def __call__(self, x, indices, scores=None, weighted_sum=False) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
         original_dtype = x.dtype
 
@@ -434,7 +446,12 @@ class SwitchGLU(nn.Module):
                     native_kinds = f16_native_kinds
                     use_f16_moe = True
             if all(kind is not None for kind in native_kinds):
-                block_bm, block_variant = _mxfp4_block_config(idx.size)
+                block_kind = (
+                    "mxfp4"
+                    if all(kind == "mxfp4" for kind in native_kinds)
+                    else "affine"
+                )
+                block_bm, block_variant = _block_config(idx.size, block_kind)
                 block_meta, block_count = _build_mxfp4_blocks(
                     idx,
                     self.up_proj.num_experts,
@@ -538,6 +555,18 @@ class SwitchGLU(nn.Module):
             sorted_indices=do_sort,
             block_plan=block_plan,
         )
+
+        if (
+            weighted_sum
+            and scores is not None
+            and do_sort
+            and scores.shape[-1] in (6, 8)
+            and scores.dtype == mx.float32
+            and x.dtype in (mx.float16, mx.bfloat16)
+            and glm_fast.has_symbol("glm_moe_weighted_sum")
+        ):
+            y = glm_fast.glm_moe_weighted_sum(x, inv_order, scores)
+            return y.astype(original_dtype) if use_f16_moe else y
 
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)

@@ -35,6 +35,7 @@ except ImportError:
 
 from omlx.model_discovery import (
     MLX_LM_TEXT_ONLY_MODEL_TYPES,
+    VLM_NATIVE_TEXT_MODEL_TYPES,
     _has_vision_subconfig,
 )
 
@@ -48,6 +49,12 @@ _OQ_DEFAULT_GROUP_SIZE = 64
 
 _GLM_INDEXER_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 _GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
+
+_QWEN4_EXP_NGRAM_GROUP_SIZE = 32
+_QWEN4_EXP_NGRAM_SHARD_RE = re.compile(
+    r"\.ple\.ple_embedding\.ngram_embedding\."
+    r"(?:shard_\d+|shards\.\d+)$"
+)
 
 _MAX_MODEL_RAM_FRACTION = 0.75
 
@@ -141,7 +148,7 @@ def _is_vlm_load(config: dict) -> bool:
     ``mlx_vlm.speculative.drafters.<type>`` lookup and fails.
     """
     model_type = str(config.get("model_type", "")).lower().replace("-", "_")
-    return (
+    return model_type in VLM_NATIVE_TEXT_MODEL_TYPES or (
         _has_vision_subconfig(config)
         and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
     )
@@ -155,7 +162,10 @@ def _uses_quantized_source_sensitivity(config: dict) -> bool:
     quant_method = str(quantization_config.get("quant_method", "")).lower()
     if quant_method == "mxfp8":
         return True
-    return quant_method == "fp8" and _is_deepseek_v4_config(config)
+    return quant_method == "fp8" and (
+        _is_deepseek_v4_config(config)
+        or config.get("model_type") == "bailing_hybrid"
+    )
 
 
 def _is_minimax_m3_config(config: dict) -> bool:
@@ -307,7 +317,13 @@ def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
     while making the saved checkpoint incompatible with the fused Q8 loader.
     Keep backbone and preserved-MTP indexers on the same explicit format.
     """
-    if config.get("model_type") != "glm_moe_dsa":
+    text_config = config.get("text_config")
+    text_model_type = (
+        text_config.get("model_type") if isinstance(text_config, dict) else None
+    )
+    if config.get("model_type") not in ("glm_moe_dsa", "glm5_next") and (
+        text_model_type != "glm5_next_text"
+    ):
         return None
     path = _normalize_quant_path(path)
     if ".self_attn.indexer." not in path:
@@ -315,6 +331,38 @@ def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
     if not path.endswith(tuple(f".{name}" for name in _GLM_INDEXER_PROJECTIONS)):
         return None
     return dict(_GLM_INDEXER_Q8)
+
+
+def _is_qwen4_exp_ngram_embedding_tensor(path: str, config: dict) -> bool:
+    """Return whether *path* is one Qwen4-Exp PLE embedding shard.
+
+    The source checkpoint spells shards as ``shard_N`` while the model
+    sanitizer maps them to the runtime module path ``shards.N``. Match both
+    forms so proxy construction and final streaming quantization use the same
+    policy.
+    """
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        text_config = {}
+    model_types = (
+        str(config.get("model_type") or "").lower(),
+        str(text_config.get("model_type") or "").lower(),
+    )
+    if not any(model_type.startswith("qwen4_exp") for model_type in model_types):
+        return False
+    return _QWEN4_EXP_NGRAM_SHARD_RE.search(_normalize_quant_path(path)) is not None
+
+
+def _is_token_embedding_tensor(path: str) -> bool:
+    """Return whether a weight is indexed by token id rather than activations."""
+    return path.lower().endswith(
+        (
+            ".embed_tokens.weight",
+            ".tok_embeddings.weight",
+            ".word_embeddings.weight",
+            ".wte.weight",
+        )
+    )
 
 
 def universal_quant_predicate(
@@ -684,6 +732,29 @@ def _estimate_effective_bpw(
         total_bits += 8 * _tensor_quantized_bytes(shape, bits, gs, mode)
 
     return total_bits / max(total_params, 1)
+
+
+def _structural_quant_overrides(
+    named_shapes: dict[str, tuple], config: dict, oq_level: int
+) -> dict[str, dict]:
+    """Layouts fixed by a model invariant rather than the bit allocator.
+
+    Qwen4-Exp PLE rows are 160 elements wide.  The writer always uses group
+    size 32 for them, but pricing them at the default group size 64 makes the
+    planner classify the table as an unquantizable 16-bpw tensor.  Since PLE
+    is about 51B parameters, that false cost can exhaust the entire budget and
+    suppress every protection boost even though the writer emits Q4/group32.
+    """
+    base_bits = _base_bits_for_level(oq_level)
+    return {
+        path: {
+            "bits": base_bits,
+            "group_size": _QWEN4_EXP_NGRAM_GROUP_SIZE,
+            "mode": "affine",
+        }
+        for path in named_shapes
+        if _is_qwen4_exp_ngram_embedding_tensor(path, config)
+    }
 
 
 def _collect_named_weight_shapes_from_model(model) -> dict[str, tuple]:
@@ -1232,6 +1303,28 @@ def resolve_output_name(
 
 GEMMA4_ASSISTANT_MTP_PREFIX = "language_model.mtp."
 GEMMA4_ASSISTANT_MTP_SHARD = "model-mtp.safetensors"
+MTPLX_SIDECAR_SHARD = "mtp.safetensors"
+MTPLX_RUNTIME_FILE = "mtplx_runtime.json"
+
+# MTPLX forge calibrates the contract per model; oMLX's Lightning MTP
+# runtime implements exactly one execution convention, so anything else is
+# rejected fail-closed at import time. Missing fields mean the MTPLX
+# documented defaults (mtplx.mtp_patch.MTPContract), which is how
+# pre-calibration exports (mtplx 0.1.0-preview) ship.
+_MTPLX_CONTRACT_DEFAULTS = {
+    "base_hidden_variant": "post_norm",
+    "hidden_variant": "post_norm",
+    "concat_order": "embedding_hidden",
+    "mtp_position_mode": "cache",
+}
+
+_MTPLX_CONTRACT_ALLOWLIST = {
+    "arch_id": ("qwen3-next-mtp",),
+    "base_hidden_variant": ("post_norm",),
+    "hidden_variant": ("post_norm",),
+    "concat_order": ("embedding_hidden",),
+    "mtp_position_mode": ("local", "cache"),
+}
 
 
 def validate_gemma4_assistant_pair(
@@ -1316,8 +1409,7 @@ def combine_gemma4_assistant_mtp(
         (assistant_config.get("text_config") or {}).get("num_hidden_layers", 0) or 0
     )
     text_config["mtp_assistant_config"] = assistant_config
-    with open(output / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
+    _atomic_write_json(output / "config.json", config)
 
     logger.info(
         "Merged gemma4 assistant MTP head into %s "
@@ -1332,18 +1424,36 @@ def combine_gemma4_assistant_mtp(
 # ── Native MTP head donor combine (Qwen3.5/3.6) ─────────────────────────
 
 
-def _write_mtp_shard_and_merge_index(output: Path, mtp_weights: dict) -> int:
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Atomically replace a JSON file (tmp write + rename)."""
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
+    ) as tmp:
+        json.dump(payload, tmp, indent=2)
+        tmp.flush()
+        temp_name = tmp.name
+    Path(temp_name).replace(path)
+
+
+def _write_mtp_shard_and_merge_index(
+    output: Path,
+    mtp_weights: dict,
+    *,
+    write_shard: bool = True,
+) -> int:
     """Write mtp weights as one extra shard and merge the safetensors index.
 
-    Shared by the gemma4 assistant combine and the native donor graft (the
-    shard name is historical). The index merge is a no-op when the output
-    has no ``model.safetensors.index.json``. Returns the shard byte size.
+    Shared by the gemma4 assistant combine and native MTP imports (the shard
+    was renamed into place already when ``write_shard`` is False). The index
+    merge is a no-op when the output has no ``model.safetensors.index.json``.
+    Returns the tensor byte size.
     """
-    mx.save_safetensors(
-        str(output / GEMMA4_ASSISTANT_MTP_SHARD),
-        mtp_weights,
-        metadata={"format": "mlx"},
-    )
+    if write_shard:
+        mx.save_safetensors(
+            str(output / GEMMA4_ASSISTANT_MTP_SHARD),
+            mtp_weights,
+            metadata={"format": "mlx"},
+        )
     mtp_size = sum(v.nbytes for v in mtp_weights.values())
 
     out_index_path = output / "model.safetensors.index.json"
@@ -1356,9 +1466,201 @@ def _write_mtp_shard_and_merge_index(output: Path, mtp_weights: dict) -> int:
         metadata = index.get("metadata") or {}
         metadata["total_size"] = int(metadata.get("total_size", 0) or 0) + mtp_size
         index["metadata"] = metadata
-        with open(out_index_path, "w") as f:
-            json.dump(index, f, indent=2)
+        _atomic_write_json(out_index_path, index)
     return mtp_size
+
+
+def _synthesize_mtp_quant_entries(
+    donor_quant: dict,
+    mtp_key_shards: dict,
+    *,
+    recipient_prefix: str,
+) -> dict:
+    """Build per-layer quant entries for modules with explicit ``.scales``."""
+    if not isinstance(donor_quant, dict):
+        return {}
+    donor_global = {
+        k: donor_quant[k] for k in ("group_size", "bits", "mode") if k in donor_quant
+    }
+    quant_entries: dict = {}
+    for key in mtp_key_shards:
+        if not key.endswith(".scales"):
+            continue
+        base = key[: -len(".scales")]
+        bare_module = _strip_mtp_key_prefix(base)
+        if bare_module is None:
+            continue
+        candidates = (
+            base,
+            bare_module,
+            "language_model." + bare_module,
+            "model." + bare_module,
+            "model.language_model." + bare_module,
+        )
+        spec = None
+        for candidate in candidates:
+            value = donor_quant.get(candidate)
+            if isinstance(value, dict):
+                spec = value
+                break
+        if spec is None:
+            if not donor_global:
+                raise ValueError(
+                    "Donor MTP head is quantized but its config declares no "
+                    "global quantization parameters"
+                )
+            spec = donor_global
+        quant_entries[recipient_prefix + bare_module] = dict(spec)
+    return quant_entries
+
+
+def _resolve_mtplx_sidecar(model_path: Path, config: dict) -> Optional[Path]:
+    """Resolve the MTPLX side-car weights file, or None.
+
+    Follows MTPLX's own resolution order: the config-declared
+    ``mlx_lm_extra_tensors.mtp_file`` first, then the conventional
+    locations (``mtplx.artifacts.expected_mtp_file``).
+    """
+    candidates: list[str] = []
+    extra = config.get("mlx_lm_extra_tensors")
+    if isinstance(extra, dict) and extra.get("mtp_file"):
+        candidates.append(str(extra["mtp_file"]))
+    candidates += [
+        MTPLX_SIDECAR_SHARD,
+        "mtp/weights.safetensors",
+        GEMMA4_ASSISTANT_MTP_SHARD,
+    ]
+    for rel in candidates:
+        path = model_path / rel
+        if path.is_file():
+            return path
+    return None
+
+
+def _validate_mtplx_runtime_contract(model_path: Path, config: dict) -> None:
+    """Fail-closed check that the export's contract matches oMLX's runtime.
+
+    The contract comes from ``mtplx_runtime.json`` (Forge always writes it),
+    with ``config.json -> mtplx_mtp_contract`` as the base layer and the
+    MTPLX documented defaults filling anything omitted.
+    """
+    runtime_path = model_path / MTPLX_RUNTIME_FILE
+    if not runtime_path.exists():
+        raise ValueError(f"Missing required runtime contract: {runtime_path}")
+    with open(runtime_path) as f:
+        runtime = json.load(f)
+
+    checks: dict = dict(_MTPLX_CONTRACT_DEFAULTS)
+    for layer in (config.get("mtplx_mtp_contract"), runtime.get("mtp_contract")):
+        if isinstance(layer, dict):
+            checks.update({k: layer[k] for k in _MTPLX_CONTRACT_DEFAULTS if k in layer})
+    checks["arch_id"] = runtime.get("arch_id")
+
+    for field, allowed in _MTPLX_CONTRACT_ALLOWLIST.items():
+        if checks.get(field) not in allowed:
+            raise ValueError(
+                f"Unsupported MTPLX contract {field}={checks.get(field)!r}; "
+                f"oMLX's MTP runtime supports {' / '.join(allowed)}"
+            )
+
+
+def import_mtplx_sidecar(model_path: Union[str, Path]) -> dict:
+    """Import an MTPLX side-car head into the model's checkpoint index.
+
+    Fail-closed on unsupported runtime contracts. Normalizes the side-car
+    onto a ``model-mtp.safetensors`` shard (zero-copy rename when the tensor
+    keys already match the checkpoint's naming, remapped copy otherwise) so
+    the stock mlx-lm/mlx-vlm weight globs and the index-based MTP detection
+    see the head with no load-time special casing. mlx_lm only ever opens
+    ``model*.safetensors``, which is why pointing the index at the original
+    side-car name is not enough. Idempotent: re-running is a no-op.
+    """
+    output = Path(model_path)
+    with open(output / "config.json") as f:
+        config = json.load(f)
+
+    sidecar = _resolve_mtplx_sidecar(output, config)
+    if sidecar is None:
+        raise ValueError(f"No MTPLX side-car weights found in {output}")
+    _validate_mtplx_runtime_contract(output, config)
+
+    audit = config.get("mtplx_mtp_payload_audit")
+    if isinstance(audit, dict) and not bool(audit.get("passed", True)):
+        raise ValueError("mtplx_mtp_payload_audit.passed is false")
+
+    output_keys = _shard_key_map(output)
+    recipient_prefix = (
+        "language_model."
+        if any(k.startswith("language_model.") for k in output_keys)
+        else ""
+    )
+
+    sidecar_weights = mx.load(str(sidecar))
+    mtp_weights = {}
+    for key, value in sidecar_weights.items():
+        bare = _strip_mtp_key_prefix(key)
+        if bare is not None:
+            mtp_weights[recipient_prefix + bare] = value
+    if not mtp_weights:
+        raise ValueError(f"No mtp.* tensors found in side-car: {sidecar}")
+
+    # Idempotency: the index (not the header fallback of _shard_key_map,
+    # which would see the not-yet-imported side-car itself) is what the MTP
+    # weight detection reads, so it is the import-completed marker.
+    index_path = output / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            indexed = json.load(f).get("weight_map") or {}
+        if all(key in indexed for key in mtp_weights):
+            logger.info("MTPLX side-car already imported into %s", output.name)
+            return {"merge_mode": "noop", "mtp_tensors": len(mtp_weights)}
+
+    shard_path = output / GEMMA4_ASSISTANT_MTP_SHARD
+    if set(mtp_weights) == set(sidecar_weights):
+        merge_mode = "rename"
+        if sidecar != shard_path:
+            sidecar.replace(shard_path)
+        mtp_size = _write_mtp_shard_and_merge_index(
+            output, mtp_weights, write_shard=False
+        )
+    else:
+        # VLM-shaped checkpoints need the language_model. prefix on disk.
+        # Materialize before touching files: the loaded arrays lazily
+        # reference the side-car file.
+        merge_mode = "remap"
+        mx.eval(*mtp_weights.values())
+        mtp_size = _write_mtp_shard_and_merge_index(output, mtp_weights)
+        if sidecar.parent == output:
+            # Keep the consumed side-car out of mlx-vlm's *.safetensors
+            # glob; sub-directory side-cars are invisible to it already.
+            sidecar.replace(sidecar.with_name(sidecar.name + ".orig"))
+
+    donor_quant = (
+        config.get("mtplx_mtp_quantization") or config.get("quantization") or {}
+    )
+    quant_entries = _synthesize_mtp_quant_entries(
+        donor_quant,
+        {k: GEMMA4_ASSISTANT_MTP_SHARD for k in sidecar_weights},
+        recipient_prefix=recipient_prefix,
+    )
+    if quant_entries:
+        for section in ("quantization", "quantization_config"):
+            section_cfg = config.get(section)
+            if isinstance(section_cfg, dict):
+                section_cfg.update(quant_entries)
+
+    scope = _mtp_text_scope(config)
+    scope["mtp_num_hidden_layers"] = max(_mtp_declared_layers(config), 1)
+    _atomic_write_json(output / "config.json", config)
+
+    logger.info(
+        "Imported MTPLX side-car into %s (%s, %d tensors, %.2f GB)",
+        output.name,
+        merge_mode,
+        len(mtp_weights),
+        mtp_size / 1e9,
+    )
+    return {"merge_mode": merge_mode, "mtp_tensors": len(mtp_weights)}
 
 
 def _file_sha256(path: Path) -> str:
@@ -1582,38 +1884,11 @@ def combine_mtp_donor(
     # mlx-lm's class_predicate applies the recipient's *global* bits to the
     # donor-packed arrays and the strict load fails on shape mismatch.
     donor_quant = donor_config.get("quantization") or {}
-    donor_global = {
-        k: donor_quant[k] for k in ("group_size", "bits", "mode") if k in donor_quant
-    }
-    quant_entries: dict = {}
-    for key in mtp_key_shards:
-        if not key.endswith(".scales"):
-            continue
-        base = key[: -len(".scales")]
-        bare_module = _strip_mtp_key_prefix(base)
-        if bare_module is None:
-            continue
-        candidates = (
-            base,
-            bare_module,
-            "language_model." + bare_module,
-            "model." + bare_module,
-            "model.language_model." + bare_module,
-        )
-        spec = None
-        for candidate in candidates:
-            value = donor_quant.get(candidate)
-            if isinstance(value, dict):
-                spec = value
-                break
-        if spec is None:
-            if not donor_global:
-                raise ValueError(
-                    "Donor MTP head is quantized but its config declares no "
-                    "global quantization parameters"
-                )
-            spec = donor_global
-        quant_entries[recipient_prefix + bare_module] = dict(spec)
+    quant_entries = _synthesize_mtp_quant_entries(
+        donor_quant,
+        mtp_key_shards,
+        recipient_prefix=recipient_prefix,
+    )
 
     if quant_entries:
         for section in ("quantization", "quantization_config"):
@@ -1625,8 +1900,7 @@ def combine_mtp_donor(
     # re-declare it where the recipient keeps its num_hidden_layers.
     scope = _mtp_text_scope(config)
     scope["mtp_num_hidden_layers"] = _mtp_declared_layers(donor_config)
-    with open(output / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
+    _atomic_write_json(output / "config.json", config)
 
     logger.info(
         "Grafted donor MTP head into %s (%d tensors, %.2f GB, source=%s)",
@@ -1985,12 +2259,25 @@ class _TrackedTensor:
         new_shape = tuple(self.shape[d] for d in dims)
         if self.transform == "nested_unreplayable":
             return self._unreplayable(shape=new_shape)
+        op = ("moveaxis", src_ax, dst_ax)
+        if len(self.sources) > 1:
+            expr = self.as_expr()
+            expr = self._wrap_expr_op(expr, op) if expr is not None else None
+            if expr is None:
+                return self._unreplayable(shape=new_shape)
+            return _TrackedTensor(
+                new_shape,
+                self.dtype,
+                list(self.sources),
+                "expr",
+                expr=expr,
+            )
         return _TrackedTensor(
             new_shape,
             self.dtype,
             list(self.sources),
             f"moveaxis_{src_ax}_{dst_ax}",
-            recipe=list(self.recipe) + [("moveaxis", src_ax, dst_ax)],
+            recipe=list(self.recipe) + [op],
         )
 
     def transpose(self, *axes):
@@ -2145,6 +2432,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "contiguous": getattr(mx, "contiguous", None),
         "from_fp8": getattr(mx, "from_fp8", None),
         "pad": getattr(mx, "pad", None),
+        "issubdtype": mx.issubdtype,
     }
 
     def _is_plain_source(tensor):
@@ -2288,6 +2576,28 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     def _noop(*a, **kw):
         pass
 
+    def _fake_issubdtype(dtype, category):
+        if isinstance(dtype, str):
+            dtype = {
+                "BF16": mx.bfloat16,
+                "F16": mx.float16,
+                "F32": mx.float32,
+                "F64": mx.float32,
+                "F8_E4M3": mx.float16,
+                "F8_E5M2": mx.float16,
+                "F8_E8M0": mx.uint8,
+                "I8": mx.int8,
+                "I16": mx.int16,
+                "I32": mx.int32,
+                "I64": mx.int64,
+                "U8": mx.uint8,
+                "U16": mx.uint16,
+                "U32": mx.uint32,
+                "U64": mx.uint64,
+                "BOOL": mx.bool_,
+            }.get(dtype.upper(), dtype)
+        return _orig["issubdtype"](dtype, category)
+
     mx.stack = _fake_stack
     mx.concatenate = _fake_concatenate
     mx.split = _fake_split
@@ -2297,6 +2607,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     mx.moveaxis = _fake_moveaxis
     mx.transpose = _fake_transpose
     mx.expand_dims = _fake_expand_dims
+    mx.issubdtype = _fake_issubdtype
     if _orig["swapaxes"] is not None:
         mx.swapaxes = _fake_swapaxes
     if _orig["contiguous"] is not None:
@@ -2990,13 +3301,17 @@ def estimate_bpw_and_size(
                 pos_sens[str(i)] = 0.01
         config["_oq_sensitivity_map"] = pos_sens
 
+        plan_fixed_overrides = {
+            **fixed_overrides,
+            **_structural_quant_overrides(named_shapes, config, oq_level),
+        }
         plan = _build_quant_plan(
             named_shapes,
             config,
             oq_level,
             target_bpw=_level_targets[0],
             hard_cap_bpw=_level_targets[1],
-            fixed_overrides=fixed_overrides,
+            fixed_overrides=plan_fixed_overrides,
         )
         config["_oq_boost_map"] = plan.boost_map
     else:
@@ -3507,6 +3822,7 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
     is_vlm = (
         any("ForConditionalGeneration" in a for a in architectures)
         or _has_vision_subconfig(config)
+        or model_type in VLM_NATIVE_TEXT_MODEL_TYPES
     ) and not (text_only or mlx_lm_text_only)
 
     if is_vlm:
@@ -3533,8 +3849,20 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                     )
 
                     apply_mlx_vlm_inkling_compat_patch()
+                if model_type == "muse_glimmer":
+                    from omlx.patches.mlx_vlm_muse_glimmer_compat import (
+                        apply_mlx_vlm_muse_glimmer_compat_patch,
+                    )
+
+                    apply_mlx_vlm_muse_glimmer_compat_patch()
+                if model_type == "glm5_next":
+                    from omlx.patches.mlx_vlm_glm5_next_compat import (
+                        apply_mlx_vlm_glm5_next_compat_patch,
+                    )
+
+                    apply_mlx_vlm_glm5_next_compat_patch()
             except Exception as patch_err:
-                logger.debug(f"MiniMax M3 mlx-vlm patch not applied: {patch_err}")
+                logger.debug(f"mlx-vlm compatibility patch not applied: {patch_err}")
 
             from mlx_vlm.utils import get_model_and_args, sanitize_weights
 
@@ -3600,6 +3928,13 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                     audio_tower = _AUDIO_SENTINEL
                     embed_audio = _AUDIO_SENTINEL
 
+                    # Runtime mmap models intentionally discard checkpoint PLE
+                    # weights because DiskBackedShardedEmbedding reads them
+                    # directly. The streaming quantizer still needs those
+                    # tensors in the sanitize plan so it can write the compact
+                    # affine PLE artifact.
+                    _omlx_preserve_qwen4_ple_for_quantization = True
+
                     # Some sanitizes call sibling instance methods (inkling's
                     # ``self._map_llm_layer`` / ``self._map_experts``) or read
                     # class attributes (``self._ATTN``). Resolve anything the
@@ -3619,6 +3954,31 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 # discovery works without instantiating the full model.
                 _lm_proxy = type("_LMProxy", (), {})()
                 _lm_proxy.args = text_config
+                if model_type == "glm5_next":
+                    attention_proxy = type("_AttentionProxy", (), {"embed_q": None})
+                    layer_proxy = type(
+                        "_LayerProxy",
+                        (),
+                        {"self_attn": attention_proxy()},
+                    )
+                    _lm_proxy.model = type(
+                        "_ModelProxy",
+                        (),
+                        {
+                            "layers": [
+                                layer_proxy()
+                                for _ in range(text_config.num_hidden_layers)
+                            ]
+                        },
+                    )()
+                    _lm_proxy.sanitize = lambda weights: model_module.LanguageModel.sanitize(
+                        _lm_proxy, weights
+                    )
+                    _vision_proxy = type("_VisionProxy", (), {})()
+                    _vision_proxy.sanitize = (
+                        lambda weights: model_module.VisionModel.sanitize(weights)
+                    )
+                    proxy.vision_model = _vision_proxy
                 proxy.language_model = _lm_proxy
                 # Model.sanitize is an instance method (self, weights) for most
                 # VLMs, but a @staticmethod (weights) for the DeepSeek-OCR family
@@ -3635,12 +3995,19 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 # (inkling's __init__ has no VisionModel); a missing class
                 # simply has no per-tower sanitize to run.
                 vision_cls = getattr(model_module, "VisionModel", None)
-                if vision_cls is not None:
+                if vision_cls is not None and model_type != "glm5_next":
                     w = sanitize_weights(vision_cls, w, vision_config)
                 language_cls = getattr(model_module, "LanguageModel", None)
-                if language_cls is not None:
+                if language_cls is not None and model_type != "glm5_next":
                     w = sanitize_weights(language_cls, w, text_config)
                 return w
+
+            if model_type == "glm5_next":
+                from mlx_vlm.models.glm5_next.language import (
+                    glm5_next_cast_predicate,
+                )
+
+                _vlm_sanitize._omlx_cast_predicate = glm5_next_cast_predicate
 
             logger.info(
                 f"Using mlx-vlm full sanitize chain for "
@@ -3684,6 +4051,21 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
             except Exception as patch_err:
                 logger.debug(f"laguna patch not applied: {patch_err}")
 
+        # Hy3 is vendored into ``sys.modules`` like Laguna, but its published
+        # Hy-MT2 checkpoints also use the legacy root-level ``rope_theta``
+        # schema. Sanitizer/proxy discovery consumes this in-memory config
+        # directly (without ``mlx_lm.utils.load_config``), so register the
+        # model and normalize the schema before ``ModelArgs.from_dict``.
+        if config.get("model_type") == "hy_v3":
+            try:
+                from omlx.patches.hy_v3 import apply_hy_v3_patch
+                from omlx.utils.model_loading import normalize_hy_v3_rope_config
+
+                normalize_hy_v3_rope_config(config)
+                apply_hy_v3_patch()
+            except Exception as patch_err:
+                logger.debug(f"hy_v3 patch not applied: {patch_err}")
+
         if config.get("model_type") == "mimo_v2":
             try:
                 from omlx.patches.mimo_v2 import apply_mimo_v2_patch
@@ -3691,6 +4073,14 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 apply_mimo_v2_patch()
             except Exception as patch_err:
                 logger.debug(f"mimo_v2 patch not applied: {patch_err}")
+
+        if config.get("model_type") == "bailing_hybrid":
+            try:
+                from omlx.patches.bailing_hybrid import apply_bailing_hybrid_patch
+
+                apply_bailing_hybrid_patch()
+            except Exception as patch_err:
+                logger.debug(f"bailing_hybrid patch not applied: {patch_err}")
 
         # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
         # mtp.* tensors correctly. Idempotent — apply() is a no-op once
@@ -3909,6 +4299,14 @@ def _get_predicate_bits(
 
     base_bits = _base_bits_for_level(oq_level)
 
+    # Qwen4-Exp's PLE rows are 160 elements wide, so the default group size
+    # 64 leaves the 100 GB N-gram table unquantized. Keep the table uniform at
+    # the selected oQ level and use the group-32 layout published by existing
+    # Qwen4-Exp quantizations. Embeddings have no input-channel imatrix entry;
+    # the streaming loop deliberately applies ordinary affine quantization.
+    if _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config):
+        return base_bits, _QWEN4_EXP_NGRAM_GROUP_SIZE, "affine"
+
     result = universal_quant_predicate(tensor_name, None, config, oq_level)
     if result is False:
         return None, None, None
@@ -4105,6 +4503,16 @@ class _LazyTensorIndex:
         """
         meta = self._index.get(key)
         return None if meta is None else meta[4]
+
+    def source_dtype(self, key):
+        """Safetensors dtype spelling for ``key``, or None when absent.
+
+        Model-specific virtual-tensor registrars use this alongside
+        :meth:`source_shape` to distinguish packed storage from an already
+        materialized floating-point checkpoint without reading tensor data.
+        """
+        meta = self._index.get(key)
+        return None if meta is None else meta[5]
 
     def load_source(self, key):
         """Load an on-disk tensor verbatim, bypassing fp8 pairing."""
@@ -4672,6 +5080,10 @@ def _source_imatrix_signature(
         # Invalidate caches produced by the old independent-block walk, which
         # captured only q_proj in the shared-KV tail of E2B/E4B.
         signature["layer_walk"] = "gemma4_shared_kv_v1"
+    elif str(config.get("model_type", "")).lower() == "glm5_next":
+        # GLM-5.3 needs its mHC-expanded layer walk plus the untied output-head
+        # capture. Older caches completed without either and must not be reused.
+        signature["layer_walk"] = "glm5_next_hc_moe_lm_head_v4"
     return signature
 
 
@@ -4853,14 +5265,42 @@ def _lookup_imatrix_importance(
     tensor_name: str,
     shape: tuple[int, ...],
     *,
+    config: dict | None = None,
     strict: bool,
     report: dict[str, Any] | None,
 ):
     if imatrix is None or not tensor_name.endswith(".weight"):
         return None
+    if config is not None and _is_qwen4_exp_ngram_embedding_tensor(
+        tensor_name, config
+    ):
+        # The collector measures Linear/SwitchLinear input channels, not
+        # embedding rows. Do not turn the intentionally uniform PLE policy
+        # into a missing-entry error under imatrix_strict.
+        return None
+    if _is_token_embedding_tensor(tensor_name):
+        # Embedding columns are gathered by token id, not consumed as input
+        # activation channels, so a Linear-style imatrix entry cannot exist.
+        return None
 
     base = tensor_name[: -len(".weight")]
     entry = imatrix.entries.get(base)
+    if entry is None and config is not None:
+        text_config = config.get("text_config")
+        text_model_type = (
+            text_config.get("model_type") if isinstance(text_config, dict) else None
+        )
+        if (
+            config.get("model_type") == "glm5_next"
+            or text_model_type == "glm5_next_text"
+        ) and base.endswith(".self_attn.indexer.weights_proj"):
+            # The GLM-5.3 indexer feeds the same hidden-state input to wk and
+            # weights_proj. Short calibration sequences bypass sparse scoring
+            # after wk, before weights_proj is called, so its wrapper cannot
+            # collect a separate entry. Reuse the mathematically identical wk
+            # input-channel statistics instead of weakening strict coverage.
+            wk_base = base[: -len("weights_proj")] + "wk"
+            entry = imatrix.entries.get(wk_base)
     if entry is None:
         if report is not None:
             report["missing"].append(base)
@@ -5648,13 +6088,17 @@ def quantize_oq_streaming(
     if _level_targets is not None:
         _t = target_bpw if target_bpw is not None else _level_targets[0]
         _c = hard_cap_bpw if hard_cap_bpw is not None else _level_targets[1]
+        plan_fixed_overrides = {
+            **fixed_overrides,
+            **_structural_quant_overrides(named_shapes, config, oq_level),
+        }
         plan = _build_quant_plan(
             named_shapes,
             config,
             oq_level,
             target_bpw=_t,
             hard_cap_bpw=_c,
-            fixed_overrides=fixed_overrides,
+            fixed_overrides=plan_fixed_overrides,
         )
         config["_oq_boost_map"] = plan.boost_map
         logger.info(
@@ -5757,6 +6201,7 @@ def quantize_oq_streaming(
                             imatrix_data,
                             tensor_name,
                             tuple(shape),
+                            config=config,
                             strict=imatrix_strict,
                             report=imatrix_report,
                         )
@@ -5967,6 +6412,7 @@ _OQE_MAX_ADAPTIVE_SAMPLES = 1024
 _OQE_MIN_EXPERT_COUNT = 16
 _OQE_MIN_EXPERT_COUNT_PERCENTILE = 5
 _OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear"}
+_OQE_MULTI_LINEAR_CLASSES = {"MultiLinear", "QuantizedMultiLinear"}
 _OQ_CODE_MULTILINGUAL_KEYS = (
     "code",
     "en",
@@ -6253,6 +6699,9 @@ def _find_model_layers(model):
     if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
         embed_fn = model.model.embed_tokens
         layers = model.model.layers
+    elif hasattr(model, "model") and hasattr(model.model, "word_embeddings"):
+        embed_fn = model.model.word_embeddings
+        layers = model.model.layers
     elif hasattr(model, "language_model") and hasattr(model.language_model, "model"):
         lm = model.language_model.model
         if hasattr(lm, "embed_tokens"):
@@ -6276,6 +6725,8 @@ def _find_model_layers(model):
 
 
 _GEMMA4_LAYER_STATE_KIND = "gemma4_shared_kv"
+_QWEN4_EXP_LAYER_STATE_KIND = "qwen4_exp"
+_GLM5_NEXT_LAYER_STATE_KIND = "glm5_next"
 
 
 def _find_layer_model(model, layers):
@@ -6422,6 +6873,57 @@ def _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs):
     return inputs, layer_masks, state
 
 
+def _prepare_qwen4_exp_layer_inputs(model, layers, calib_data, inputs):
+    """Build Qwen4-Exp's hyper-connection layer-walk inputs.
+
+    Qwen4 decoder blocks do not use the generic Transformer signature. The
+    trunk tiles token embeddings across ``hc_count`` residual streams and each
+    block receives the original token ids before mask/cache/position state.
+    Replaying a block with the generic calibration call silently skips every
+    layer, leaving an installed oQe collector with zero captured entries.
+    """
+    layer_model = _find_layer_model(model, layers)
+    if layer_model is None:
+        return None
+    args = getattr(layer_model, "args", None)
+    model_type = str(getattr(args, "model_type", "")).lower()
+    if not model_type.startswith("qwen4_exp"):
+        return None
+
+    hc_count = _object_config_int(args, "hc_count")
+    hidden_size = _object_config_int(args, "hidden_size")
+    if hc_count <= 0 or hidden_size <= 0:
+        raise RuntimeError(
+            "Qwen4-Exp calibration requires positive hc_count and hidden_size"
+        )
+    expected_width = hc_count * hidden_size
+    if int(inputs.shape[-1]) == hidden_size:
+        inputs = mx.tile(inputs, (1, 1, hc_count))
+    elif int(inputs.shape[-1]) != expected_width:
+        raise RuntimeError(
+            "Qwen4-Exp calibration received an invalid hidden width: "
+            f"{int(inputs.shape[-1])} (expected {hidden_size} or {expected_width})"
+        )
+
+    seq_len = int(calib_data.shape[1])
+    full_attention_mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
+    full_attention_mask = full_attention_mask.astype(inputs.dtype)
+    layer_masks = [
+        None if bool(getattr(layer, "is_linear", False)) else full_attention_mask
+        for layer in layers
+    ]
+    position_ids = mx.broadcast_to(
+        mx.arange(seq_len, dtype=mx.int32)[None],
+        (int(calib_data.shape[0]), seq_len),
+    )
+    state = {
+        "kind": _QWEN4_EXP_LAYER_STATE_KIND,
+        "input_ids": calib_data,
+        "position_ids": position_ids,
+    }
+    return inputs, layer_masks, state
+
+
 def _forward_gemma4_layer_result(block, inputs, mask, state, layer_idx: int):
     if not 0 <= int(layer_idx) < len(state["previous_kvs"]):
         raise RuntimeError(f"Invalid Gemma 4 calibration layer index: {layer_idx}")
@@ -6472,6 +6974,40 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
         return _forward_gemma4_layer_result(
             block, inputs, mask, position_ids, int(layer_idx)
         )
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _QWEN4_EXP_LAYER_STATE_KIND
+    ):
+        try:
+            result = block(
+                inputs,
+                position_ids["input_ids"],
+                mask=mask,
+                cache=None,
+                position_ids=position_ids["position_ids"],
+            )
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            suffix = f" at layer {layer_idx}" if layer_idx is not None else ""
+            raise RuntimeError(
+                f"Qwen4-Exp calibration forward failed{suffix}: {e}"
+            ) from e
+        if isinstance(result, tuple):
+            return result[0], result[1] if len(result) > 1 else None
+        return result, None
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _GLM5_NEXT_LAYER_STATE_KIND
+    ):
+        try:
+            result = block(inputs, mask=mask, cache=None)
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            suffix = f" at layer {layer_idx}" if layer_idx is not None else ""
+            raise RuntimeError(
+                f"GLM-5.3 calibration forward failed{suffix}: {e}"
+            ) from e
+        if isinstance(result, tuple):
+            return result[0], result[1] if len(result) > 1 else None
+        return result, None
     if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
         try:
             result = block(
@@ -6534,14 +7070,20 @@ def _forward_layer(block, inputs, mask, position_ids):
 def _layer_masks_for_model(model, layers, inputs):
     """Build the per-layer mask schedule used by the original model."""
     if hasattr(model, "make_cache") and any(
-        hasattr(layer, "is_linear") for layer in layers
+        hasattr(layer, "is_linear") or hasattr(layer, "is_global")
+        for layer in layers
     ):
         try:
             from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
             cache = model.make_cache()
-            fa_idx = getattr(getattr(model, "model", model), "fa_idx", 0)
-            ssm_idx = getattr(getattr(model, "model", model), "ssm_idx", 0)
+            model_core = getattr(model, "model", model)
+            fa_idx = getattr(
+                model_core, "fa_idx", getattr(model_core, "_attn_idx", 0)
+            )
+            ssm_idx = getattr(
+                model_core, "ssm_idx", getattr(model_core, "_gla_idx", 0)
+            )
             fa_cache = cache[fa_idx] if fa_idx < len(cache) else None
             ssm_cache = cache[ssm_idx] if ssm_idx < len(cache) else None
             try:
@@ -6561,8 +7103,15 @@ def _layer_masks_for_model(model, layers, inputs):
                 # SSM layers (GatedDeltaNet) expect (B, S) boolean mask, not
                 # (S, S) causal mask.  During calibration there is no padding,
                 # so None is the correct mask for SSM layers.
+                def _is_ssm_layer(layer):
+                    if hasattr(layer, "is_linear"):
+                        return bool(layer.is_linear)
+                    if hasattr(layer, "is_global"):
+                        return not bool(layer.is_global)
+                    return False
+
                 return [
-                    ssm_mask if getattr(layer, "is_linear", False) else fa_mask
+                    ssm_mask if _is_ssm_layer(layer) else fa_mask
                     for layer in layers
                 ]
         except (ImportError, AttributeError):
@@ -6634,6 +7183,28 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs):
     gemma4_inputs = _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs)
     if gemma4_inputs is not None:
         return gemma4_inputs
+    qwen4_exp_inputs = _prepare_qwen4_exp_layer_inputs(
+        model, layers, calib_data, inputs
+    )
+    if qwen4_exp_inputs is not None:
+        return qwen4_exp_inputs
+    if model_type == "glm5_next":
+        language_model = getattr(model, "language_model", None)
+        args = getattr(language_model, "args", None)
+        hc_mult = _object_config_int(args, "hc_mult")
+        if hc_mult <= 0:
+            raise RuntimeError("GLM-5.3 calibration requires a positive hc_mult")
+        hidden = mx.broadcast_to(
+            inputs[:, :, None, :],
+            (inputs.shape[0], inputs.shape[1], hc_mult, inputs.shape[2]),
+        )
+        hidden = mx.contiguous(hidden)
+        attention_mask = create_attention_mask(inputs, None, return_array=True)
+        masks = [
+            None if bool(getattr(layer, "is_linear", False)) else attention_mask
+            for layer in layers
+        ]
+        return hidden, masks, {"kind": _GLM5_NEXT_LAYER_STATE_KIND}
     if model_type.startswith("deepseek_v4"):
         args = model.args
         h = mx.broadcast_to(
@@ -6693,9 +7264,17 @@ class _ImatrixCaptureWrapper(nn.Module):
                 self._collector.collect_switch(
                     self._name, self._module, args[0], args[1]
                 )
+            elif type(self._module).__name__ in _OQE_MULTI_LINEAR_CLASSES:
+                transpose = kwargs.get("transpose", args[1] if len(args) >= 2 else True)
+                self._collector.collect_multi(
+                    self._name, self._module, args[0], transpose=transpose
+                )
             else:
                 self._collector.collect_dense(self._name, self._module, args[0])
-        return self._module(*args, **kwargs)
+        result = self._module(*args, **kwargs)
+        if args and self._name.endswith(".self_attn.q_b_proj"):
+            self._collector.collect_glm5_next_embed_q(self._name, result)
+        return result
 
 
 class OQImatrixCollector:
@@ -6704,6 +7283,7 @@ class OQImatrixCollector:
     def __init__(self):
         self.entries: dict[str, OQImatrixEntry] = {}
         self._original_modules: dict[str, Any] = {}
+        self._saved_attributes: list[tuple[Any, str, Any]] = []
         self.capture_module_classes: dict[str, int] = {}
         self.switch_capture_modules = 0
 
@@ -6711,6 +7291,8 @@ class OQImatrixCollector:
     def _is_capture_module(module) -> bool:
         cls = type(module).__name__
         if cls in _OQE_SWITCH_LINEAR_CLASSES:
+            return hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 3
+        if cls in _OQE_MULTI_LINEAR_CLASSES:
             return hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 3
         # QuantizedLinear capture lets imatrix collection run against
         # already-quantized checkpoints (e.g. deriving a recalibrated MTP
@@ -6732,6 +7314,15 @@ class OQImatrixCollector:
     def install(self, model) -> int:
         replacements = []
         for name, module in model.named_modules():
+            if type(module).__name__ == "Glm5NextLinearAttention" and bool(
+                getattr(module, "fuse_in", False)
+            ):
+                # The fused KDA input projection reads six Linear weights
+                # directly, bypassing their calls and therefore the capture
+                # wrappers. Calibration temporarily takes the equivalent
+                # unfused path so every input-channel statistic is observed.
+                self._saved_attributes.append((module, "fuse_in", module.fuse_in))
+                module.fuse_in = False
             if not name or not self._is_capture_module(module):
                 continue
             cls = type(module).__name__
@@ -6753,6 +7344,9 @@ class OQImatrixCollector:
                 strict=False,
             )
             self._original_modules.clear()
+        for module, attribute, value in self._saved_attributes:
+            setattr(module, attribute, value)
+        self._saved_attributes.clear()
 
     def _ensure_entry(self, name: str, sums_shape, counts_shape) -> OQImatrixEntry:
         entry = self.entries.get(name)
@@ -6778,6 +7372,65 @@ class OQImatrixCollector:
             entry.counts[0] += x_np.shape[0]
         except Exception as e:
             logger.debug("oQe imatrix dense capture skipped for %s: %s", name, e)
+
+    def collect_multi(self, name: str, module, x, *, transpose: bool = True) -> None:
+        """Capture per-head input energy for MLA MultiLinear weights."""
+        try:
+            if not transpose:
+                # The same MLA projection may be used in reverse. Quantization
+                # groups the stored weight's last dimension, whose matching
+                # activation is observed by the normal transpose=True call.
+                return
+            weight = module.weight
+            n_heads = int(weight.shape[0])
+            bits = getattr(module, "bits", None)
+            in_dim = (
+                int(weight.shape[-1] * 32 // int(bits))
+                if bits and weight.dtype == mx.uint32
+                else int(weight.shape[-1])
+            )
+            if not getattr(x, "shape", ()) or int(x.shape[-1]) != in_dim:
+                return
+            mx.eval(x)
+            x_np = np.asarray(x.astype(mx.float32))
+            if x_np.ndim >= 2 and x_np.shape[-2] in (1, n_heads):
+                per_head = np.moveaxis(x_np, -2, 0).reshape(x_np.shape[-2], -1, in_dim)
+                if per_head.shape[0] == 1 and n_heads > 1:
+                    per_head = np.repeat(per_head, n_heads, axis=0)
+            else:
+                shared = x_np.reshape(-1, in_dim)
+                per_head = np.repeat(shared[None], n_heads, axis=0)
+            entry = self._ensure_entry(name, (n_heads, in_dim), (n_heads,))
+            entry.in_sum2 += np.square(per_head, dtype=np.float32).sum(axis=1)
+            entry.counts += per_head.shape[1]
+        except Exception as e:
+            logger.debug("oQe imatrix multi capture skipped for %s: %s", name, e)
+
+    def collect_glm5_next_embed_q(self, q_b_name: str, q) -> None:
+        """Capture the GLM-5.3 embed_q input from q_b_proj's exact output.
+
+        Short calibration sequences take the algebraically equivalent reverse
+        embed_q path, whose activation width does not match the stored weight's
+        quantization axis. Long sparse-attention requests use the forward path
+        on q_b_proj's reshaped output, so collect that tensor directly without
+        forcing calibration past the production indexer's short-prefix bypass.
+        """
+        embed_name = q_b_name[: -len("q_b_proj")] + "embed_q"
+        module = self._original_modules.get(embed_name)
+        if module is None or type(module).__name__ not in _OQE_MULTI_LINEAR_CLASSES:
+            return
+        try:
+            weight = module.weight
+            n_heads = int(weight.shape[0])
+            in_dim = self._module_in_dim(module)
+            if not getattr(q, "shape", ()) or int(q.shape[-1]) != n_heads * in_dim:
+                return
+            shaped_q = q.reshape(*q.shape[:-1], n_heads, in_dim)
+            self.collect_multi(embed_name, module, shaped_q)
+        except Exception as e:
+            logger.debug(
+                "oQe GLM-5.3 embed_q capture skipped for %s: %s", embed_name, e
+            )
 
     @staticmethod
     def _accumulate_switch(
@@ -6854,6 +7507,29 @@ class OQImatrixCollector:
             logger.debug("oQe imatrix switch capture skipped for %s: %s", name, e)
 
 
+def _collect_glm5_next_lm_head_imatrix(model, hidden, collector) -> bool:
+    """Capture the untied GLM-5.3 output head without materializing logits."""
+    if str(getattr(model, "model_type", "")) != "glm5_next":
+        return False
+
+    language_model = getattr(model, "language_model", None)
+    core = getattr(language_model, "model", None)
+    norm = getattr(core, "norm", None)
+    if language_model is None or core is None or norm is None:
+        return False
+
+    name = "language_model.lm_head"
+    module = collector._original_modules.get(name)
+    if module is None:
+        # Tied checkpoints project through embed_tokens and have no lm_head.
+        return False
+
+    if getattr(hidden, "ndim", 0) == 4:
+        hidden = hidden.mean(axis=2)
+    collector.collect_dense(name, module, norm(hidden))
+    return name in collector.entries
+
+
 def _collect_mtp_head_imatrix(
     model,
     batch,
@@ -6872,6 +7548,12 @@ def _collect_mtp_head_imatrix(
     inner = getattr(model, "language_model", None) or model
     mtp = getattr(inner, "mtp", None)
     if mtp is None:
+        get_mtp_module = getattr(inner, "get_mtp_module", None)
+        if callable(get_mtp_module):
+            mtp = get_mtp_module()
+    if mtp is None:
+        mtp = getattr(model, "mtp", None)
+    if mtp is None:
         return False
     try:
         dspark_calibration = getattr(inner, "dspark_calibration_forward", None)
@@ -6883,6 +7565,23 @@ def _collect_mtp_head_imatrix(
             target_hidden = mx.concatenate(dspark_hiddens, axis=-1)
             out = dspark_calibration(target_hidden, batch)
             mx.eval(out)
+            return True
+        if type(mtp).__name__ == "Qwen4ExpMTPModule":
+            core = getattr(inner, "model", None) or inner
+            embed = getattr(core, "embed_tokens", None)
+            if embed is None:
+                return False
+            make_cache = getattr(inner, "make_mtp_cache", None)
+            mtp_cache = (
+                make_cache()
+                if callable(make_cache)
+                else [None for _ in getattr(mtp, "layers", ())]
+            )
+            out = mtp(hidden[:, :-1, :], batch[:, 1:], embed, mtp_cache)
+            if isinstance(out, tuple):
+                mx.eval(*out)
+            else:
+                mx.eval(out)
             return True
         if isinstance(mtp, (list, tuple)):
             # DeepSeek-V4 style: MTPBlock stack consuming the raw (4D)
@@ -7048,6 +7747,8 @@ def _collect_imatrix_from_model(
                     mx.synchronize()
                     mx.clear_cache()
 
+                _collect_glm5_next_lm_head_imatrix(model, inputs, collector)
+
                 # MTP-head pass: the layer walk above leaves ``inputs`` as
                 # the final-layer hidden states; feed them (post-norm) plus
                 # the shifted token ids through the head so its linears
@@ -7191,10 +7892,22 @@ def _collect_imatrix(
 
     is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
-    maybe_apply_pre_load_patches(model_path, for_vlm=is_vlm)
+    has_mtp_heads = _has_mtp_heads(config)
+    calibration_settings = None
+    if has_mtp_heads and has_mtp_weights:
+        from types import SimpleNamespace
+
+        calibration_settings = SimpleNamespace(
+            mtp_enabled=True,
+            mtp_num_draft_tokens=1,
+        )
+    patch_kwargs: dict[str, Any] = {"for_vlm": is_vlm}
+    if calibration_settings is not None:
+        patch_kwargs["model_settings"] = calibration_settings
+    maybe_apply_pre_load_patches(model_path, **patch_kwargs)
 
     restore_mtp_active = None
-    if _has_mtp_heads(config) and has_mtp_weights:
+    if has_mtp_heads and has_mtp_weights:
         # Attach the MTP head on the temporary calibration model so the
         # head-forward pass in _collect_imatrix_from_model can exercise its
         # linears (they'd otherwise land in the imatrix "missing" list).
@@ -7278,14 +7991,19 @@ def _collect_imatrix(
         mx.clear_cache()
 
 
-def _oqe_cache_missing_mtp_entries(cache: OQImatrixData, config: dict) -> bool:
+def _oqe_cache_missing_mtp_entries(
+    cache: OQImatrixData, config: dict, model_path: str
+) -> bool:
     """True when the model declares MTP heads but the cache predates the
     MTP-head collection pass (no ``mtp.*`` entries) — force a recollect so
     the head gets calibrated quantization instead of landing in "missing"."""
     try:
-        from omlx.utils.model_loading import _has_mtp_heads
+        from omlx.utils.model_loading import (
+            _checkpoint_has_mtp_weights,
+            _has_mtp_heads,
+        )
 
-        if not _has_mtp_heads(config):
+        if not _has_mtp_heads(config) or not _checkpoint_has_mtp_weights(model_path):
             return False
     except Exception:
         return False
@@ -7322,7 +8040,7 @@ def _load_or_collect_imatrix(
     if reuse_cache and path.exists():
         cache = _load_oqe_imatrix(path)
         if _oqe_cache_matches(cache, expected):
-            if _oqe_cache_missing_mtp_entries(cache, config):
+            if _oqe_cache_missing_mtp_entries(cache, config, model_path):
                 logger.info(
                     "oQe imatrix: cache predates MTP-head collection "
                     "(no mtp.* entries), recollecting %s",
@@ -7510,24 +8228,31 @@ def _measure_sensitivity(
     # ship a vision_config but must load through the patched mlx-lm class.
     is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
+    has_mtp_heads = _has_mtp_heads(config)
 
     # Reuse the centralised pre-load dispatch so every current and future
     # patch (MTP sanitize, DeepSeek V4, nested-visual, load_config, …) is
     # applied exactly as in the production load path.
-    maybe_apply_pre_load_patches(model_path, for_vlm=is_vlm)
+    calibration_settings = None
+    if has_mtp_heads and has_mtp_weights:
+        from types import SimpleNamespace
 
-    # maybe_apply_pre_load_patches leaves mtp_active False, which is correct
-    # for the text path: the patched qwen35_model.sanitize self-consistently
-    # strips mtp.* when no head is attached. The VLM path needs both patches.
-    # apply_mlx_vlm_mtp_patch fixes Model.sanitize so language_model.mtp.*
-    # weights survive the load with the correct keys (stock mlx-vlm sanitize
-    # strips them, which is what made the strict load fail with "Missing N
-    # parameters" and the measurement silently return {}). The runtime patch
-    # then attaches the MTP head so the checkpoint matches the model. Both
-    # are idempotent. Sensitivity only reads backbone decoder layers, so this
-    # is load-only.
+        calibration_settings = SimpleNamespace(
+            mtp_enabled=True,
+            mtp_num_draft_tokens=1,
+        )
+    patch_kwargs: dict[str, Any] = {"for_vlm": is_vlm}
+    if calibration_settings is not None:
+        patch_kwargs["model_settings"] = calibration_settings
+    maybe_apply_pre_load_patches(model_path, **patch_kwargs)
+
+    # The central dispatch receives an explicit MTP calibration setting so
+    # model-specific constructors such as Qwen4's root-owned MTP head are
+    # enabled before load. The VLM patch below also covers the generic
+    # qwen3_5 classes whose MTP module is attached by the shared runtime.
+    # Sensitivity only reads backbone decoder layers, so this is load-only.
     restore_mtp_active = None
-    if is_vlm and _has_mtp_heads(config) and has_mtp_weights:
+    if is_vlm and has_mtp_heads and has_mtp_weights:
         try:
             from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
             from omlx.patches.mlx_vlm_mtp import (
@@ -7607,12 +8332,33 @@ def _measure_sensitivity(
 
 
 _REQUANT_VALID_BITS = {2, 3, 4, 5, 6, 8}
+_AFFINE_GROUP_SIZES = (32, 64, 128)
 
 
 def _perturb_bits_for(bits: int):
     """Closest valid re-quantization width below ``bits``, or None."""
     lower = [b for b in _REQUANT_VALID_BITS if b < bits]
     return max(lower) if lower else None
+
+
+def _affine_perturb_group_size(group_size: int, in_dim: int):
+    """Group size for an affine perturbation re-quant of a row of ``in_dim``.
+
+    The sensitivity perturbation always re-quantizes with ``mode="affine"``,
+    and affine kernels only implement group sizes 32/64/128. The source
+    module's own group size is therefore not always reusable: nvfp4 modules
+    carry ``group_size=16``, which mx.quantize rejects. Keep the module's size
+    whenever affine supports it, so affine/mxfp4/mxfp8 sources perturb exactly
+    as before; otherwise take the supported size closest to it (smallest on a
+    tie) that still divides the row. Returns None when none divides it, in
+    which case the module cannot be perturbed and is skipped.
+    """
+    usable = [g for g in _AFFINE_GROUP_SIZES if in_dim % g == 0]
+    if not usable:
+        return None
+    if group_size in usable:
+        return group_size
+    return min(usable, key=lambda g: (abs(g - group_size), g))
 
 
 def _build_proxy_for_sensitivity(
@@ -7777,14 +8523,23 @@ def _build_streaming_proxy_for_sensitivity(
                 pred = universal_quant_predicate(
                     tensor_name, None, config, _PROXY_QUANT_BITS
                 )
-                if pred is not False and len(shape) >= 2 and shape[-1] % base_gs == 0:
+                tensor_gs = (
+                    _QWEN4_EXP_NGRAM_GROUP_SIZE
+                    if _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
+                    else base_gs
+                )
+                if (
+                    pred is not False
+                    and len(shape) >= 2
+                    and shape[-1] % tensor_gs == 0
+                ):
                     if (
                         mx.issubdtype(w_mx.dtype, mx.floating)
                         and w_mx.dtype != target_dtype
                     ):
                         w_mx = w_mx.astype(target_dtype)
                     qw, scales, biases = _quantize_chunked(
-                        w_mx, base_gs, base_bits, base_mode
+                        w_mx, tensor_gs, base_bits, base_mode
                     )
                     base = (
                         tensor_name[:-7]
@@ -7795,6 +8550,12 @@ def _build_streaming_proxy_for_sensitivity(
                     out_shard_data[f"{base}.scales"] = scales
                     if biases is not None:
                         out_shard_data[f"{base}.biases"] = biases
+                    if tensor_gs != base_gs:
+                        per_layer_config[base] = {
+                            "bits": base_bits,
+                            "group_size": tensor_gs,
+                            "mode": base_mode,
+                        }
                     del qw, scales, biases
                 else:
                     if cast_predicate is None or cast_predicate(tensor_name):
@@ -7892,12 +8653,24 @@ def _measure_sensitivity_from_quantized_model(
     # Idempotent; harmless for plain mlx-lm proxies.
     is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
-    maybe_apply_pre_load_patches(model_path, for_vlm=is_vlm)
+    has_mtp_heads = _has_mtp_heads(config)
+    calibration_settings = None
+    if has_mtp_heads and has_mtp_weights:
+        from types import SimpleNamespace
+
+        calibration_settings = SimpleNamespace(
+            mtp_enabled=True,
+            mtp_num_draft_tokens=1,
+        )
+    patch_kwargs: dict[str, Any] = {"for_vlm": is_vlm}
+    if calibration_settings is not None:
+        patch_kwargs["model_settings"] = calibration_settings
+    maybe_apply_pre_load_patches(model_path, **patch_kwargs)
 
     restore_mtp_active = None
     try:
         if is_vlm:
-            if _has_mtp_heads(config) and has_mtp_weights:
+            if has_mtp_heads and has_mtp_weights:
                 try:
                     from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
                     from omlx.patches.mlx_vlm_mtp import (
@@ -8047,15 +8820,28 @@ def _measure_sensitivity_from_quantized_model(
                 bits=bits,
                 mode=mode,
             )
-            saved[p] = (m.weight, m.scales, getattr(m, "biases", None), bits, mode)
+            # Affine kernels only ship group sizes 32/64/128, so the module's
+            # own size cannot always be reused for the perturbation re-quant.
+            perturb_gs = _affine_perturb_group_size(gs, w_float.shape[-1])
+            if perturb_gs is None:
+                logger.debug(
+                    f"Sensitivity perturbation skipped for {p}: no affine group "
+                    f"size divides an input dim of {w_float.shape[-1]}"
+                )
+                continue
+            saved[p] = (m.weight, m.scales, getattr(m, "biases", None), bits, mode, gs)
             qw, sc, *rest = mx.quantize(
-                w_float, group_size=gs, bits=perturb_bits, mode="affine"
+                w_float, group_size=perturb_gs, bits=perturb_bits, mode="affine"
             )
             m.weight = qw
             m.scales = sc
             m.biases = rest[0] if rest else None
             m.bits = perturb_bits
             m.mode = "affine"
+            # The perturbed forward reads group_size off the module, so it has
+            # to track the re-quantized layout; the restore below puts the
+            # source module's own size back.
+            m.group_size = perturb_gs
             # Force re-quant materialization so the next forward sees the
             # perturbed weights instead of the lazy reference to the originals.
             if m.biases is not None:
@@ -8076,7 +8862,7 @@ def _measure_sensitivity_from_quantized_model(
         modules_by_path = dict(
             tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module)
         )
-        for p, (w, s, b, orig_bits, orig_mode) in saved.items():
+        for p, (w, s, b, orig_bits, orig_mode, orig_gs) in saved.items():
             if p in modules_by_path:
                 mod = modules_by_path[p]
                 mod.weight = w
@@ -8087,6 +8873,7 @@ def _measure_sensitivity_from_quantized_model(
                     del mod.biases
                 mod.bits = orig_bits
                 mod.mode = orig_mode
+                mod.group_size = orig_gs
 
         if out_perturbed is not None:
             # Cast to float32 first: float16 squared differences overflow
