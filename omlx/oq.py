@@ -3723,12 +3723,33 @@ def _calibration_memory_budget(
     the smaller positive value of live system memory and remaining Metal
     working-set memory. A proportional 25% reserve scales down to 16/32 GiB
     machines without imposing a fixed reserve that would reject every model.
+    OMLX_OQ_CALIBRATION_LIMIT_GB replaces the model limit with an absolute
+    GiB value at the operator's risk, without changing the measured capacity.
     """
     system_available = _system_available_memory_bytes()
     metal_available = _metal_available_memory_bytes()
     candidates = [value for value in (system_available, metal_available) if value > 0]
     capacity = min(candidates) if candidates else max(0, int(fallback_system_bytes))
     model_limit = int(capacity * _MAX_MODEL_RAM_FRACTION)
+    override = os.environ.get("OMLX_OQ_CALIBRATION_LIMIT_GB", "").strip()
+    if override:
+        error = "OMLX_OQ_CALIBRATION_LIMIT_GB must be a finite positive GiB value"
+        try:
+            limit_bytes = float(override) * 1024**3
+        except ValueError as e:
+            raise ValueError(error) from e
+        if not math.isfinite(limit_bytes) or limit_bytes < 1:
+            raise ValueError(error)
+        model_limit = int(limit_bytes)
+        logger.warning(
+            "OMLX_OQ_CALIBRATION_LIMIT_GB overrides the default %d%% limit: "
+            "limit=%s, live capacity=%s, headroom=%s. "
+            "Calibration can exhaust memory if the override is too high.",
+            int(_MAX_MODEL_RAM_FRACTION * 100),
+            _format_size(model_limit),
+            _format_size(capacity),
+            _format_size(max(0, capacity - model_limit)),
+        )
     checkpoint_bytes = max(0, int(checkpoint_bytes))
     return {
         "system_available_bytes": int(system_available),
@@ -6082,8 +6103,6 @@ def quantize_oq_streaming(
         )
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
 
-    output.mkdir(parents=True, exist_ok=True)
-
     cb("loading", 5.0, "Reading model config")
 
     weight_files = _source_weight_files(source)
@@ -6132,12 +6151,12 @@ def quantize_oq_streaming(
         _calibration_bytes,
         fallback_system_bytes=_system_ram,
     )
+    output.mkdir(parents=True, exist_ok=True)
     _model_requires_proxy = bool(_calibration_budget["requires_proxy"])
     if _model_requires_proxy and static_sensitivity_map is None:
         logger.info(
             f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
-            f"exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% of calibration "
-            "capacity "
+            "exceeds the model limit for calibration capacity "
             f"({_format_size(int(_calibration_budget['capacity_bytes']))}; "
             f"limit={_format_size(int(_calibration_budget['model_limit_bytes']))}, "
             "system available="
@@ -6192,7 +6211,9 @@ def quantize_oq_streaming(
                     f"memory budget (proxy={_format_size(proxy_bytes)}, "
                     f"resident={_format_size(proxy_resident_bytes)}, "
                     f"limit={_format_size(prebuild_limit)}, "
-                    f"capacity={_format_size(prebuild_capacity)})"
+                    f"capacity={_format_size(prebuild_capacity)}). "
+                    "Set OMLX_OQ_CALIBRATION_LIMIT_GB to an absolute GiB limit "
+                    "to override the default reserve at your own memory risk."
                 )
             _ram_safe_proxy_dir = candidate
             logger.info(
@@ -6414,8 +6435,9 @@ def quantize_oq_streaming(
                 _cleanup_ram_safe_proxy()
         elif _model_requires_proxy:
             raise RuntimeError(
-                f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% "
-                "of live calibration memory and auto_proxy_sensitivity is disabled. "
+                f"oQ{oq_level:g}: model exceeds the "
+                f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
+                "live calibration limit and auto_proxy_sensitivity is disabled. "
                 "Enable auto_proxy_sensitivity, pass sensitivity_model_path "
                 "with a pre-quantized version of this model, or run on a "
                 "machine with enough RAM."
